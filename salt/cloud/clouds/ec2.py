@@ -113,6 +113,12 @@ from salt.ext.six.moves.urllib.parse import urlparse as _urlparse, urlencode as 
 # Import 3rd-Party Libs
 # Try to import PyCrypto, which may not be installed on a RAET-based system
 try:
+    from M2Crypto import RSA
+    HAS_M2 = True
+except ImportError:
+    HAS_M2 = False
+
+try:
     import Crypto
     # PKCS1_v1_5 was added in PyCrypto 2.5
     from Crypto.Cipher import PKCS1_v1_5  # pylint: disable=E0611
@@ -194,7 +200,7 @@ def get_dependencies():
     '''
     deps = {
         'requests': HAS_REQUESTS,
-        'pycrypto': HAS_PYCRYPTO
+        'pycrypto or m2crypto': HAS_M2 or HAS_PYCRYPTO
     }
     return config.check_driver_dependencies(
         __virtualname__,
@@ -295,8 +301,8 @@ def query(params=None, setname=None, requesturl=None, location=None,
     # Retrieve access credentials from meta-data, or use provided
     access_key_id, secret_access_key, token = aws.creds(provider)
 
-    attempts = 5
-    while attempts > 0:
+    attempts = 0
+    while attempts < aws.AWS_MAX_RETRIES:
         params_with_headers = params.copy()
         timestamp = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -357,15 +363,15 @@ def query(params=None, setname=None, requesturl=None, location=None,
         querystring = querystring.replace('+', '%20')
 
         canonical_request = method + '\n' + canonical_uri + '\n' + \
-                    querystring + '\n' + canonical_headers + '\n' + \
-                    signed_headers + '\n' + payload_hash
+                querystring + '\n' + canonical_headers + '\n' + \
+                signed_headers + '\n' + payload_hash
 
         algorithm = 'AWS4-HMAC-SHA256'
         credential_scope = datestamp + '/' + region + '/' + service + '/' + 'aws4_request'
 
         string_to_sign = algorithm + '\n' +  amz_date + '\n' + \
-                         credential_scope + '\n' + \
-                         salt.utils.hashutils.sha256_digest(canonical_request)
+                credential_scope + '\n' + \
+                salt.utils.hashutils.sha256_digest(canonical_request)
 
         kDate = sign(('AWS4' + provider['key']).encode('utf-8'), datestamp)
         kRegion = sign(kDate, region)
@@ -374,12 +380,11 @@ def query(params=None, setname=None, requesturl=None, location=None,
 
         signature = hmac.new(signing_key, (string_to_sign).encode('utf-8'),
                              hashlib.sha256).hexdigest()
-        #sig = binascii.b2a_base64(hashed)
 
         authorization_header = algorithm + ' ' + 'Credential=' + \
-                               provider['id'] + '/' + credential_scope + \
-                               ', ' +  'SignedHeaders=' + signed_headers + \
-                               ', ' + 'Signature=' + signature
+                provider['id'] + '/' + credential_scope + \
+                ', ' +  'SignedHeaders=' + signed_headers + \
+                ', ' + 'Signature=' + signature
         headers = {'x-amz-date': amz_date, 'Authorization': authorization_header}
 
         log.debug('EC2 Request: %s', requesturl)
@@ -400,15 +405,14 @@ def query(params=None, setname=None, requesturl=None, location=None,
 
             # check to see if we should retry the query
             err_code = data.get('Errors', {}).get('Error', {}).get('Code', '')
-            if attempts > 0 and err_code and err_code in EC2_RETRY_CODES:
-                attempts -= 1
+            if err_code and err_code in EC2_RETRY_CODES:
+                attempts += 1
                 log.error(
                     'EC2 Response Status Code and Error: [%s %s] %s; '
                     'Attempts remaining: %s',
                     exc.response.status_code, exc, data, attempts
                 )
-                # Wait a bit before continuing to prevent throttling
-                time.sleep(2)
+                aws.sleep_exponential_backoff(attempts)
                 continue
 
             log.error(
@@ -1185,6 +1189,33 @@ def get_tenancy(vm_):
     )
 
 
+def get_imageid(vm_):
+    '''
+    Returns the ImageId to use
+    '''
+    image = config.get_cloud_config_value(
+        'image', vm_, __opts__, search_global=False
+    )
+    if image.startswith('ami-'):
+        return image
+    # a poor man's cache
+    if not hasattr(get_imageid, 'images'):
+        get_imageid.images = {}
+    elif image in get_imageid.images:
+        return get_imageid.images[image]
+    params = {'Action': 'DescribeImages',
+              'Filter.0.Name': 'name',
+              'Filter.0.Value.0': image}
+    # Query AWS, sort by 'creationDate' and get the last imageId
+    _t = lambda x: datetime.datetime.strptime(x['creationDate'], '%Y-%m-%dT%H:%M:%S.%fZ')
+    image_id = sorted(aws.query(params, location=get_location(),
+                                 provider=get_provider(), opts=__opts__, sigver='4'),
+                      lambda i, j: cmp(_t(i), _t(j))
+                      )[-1]['imageId']
+    get_imageid.images[image] = image_id
+    return image_id
+
+
 def _get_subnetname_id(subnetname):
     '''
     Returns the SubnetId of a SubnetName to use
@@ -1528,29 +1559,21 @@ def _modify_eni_properties(eni_id, properties=None, vm_=None):
     for k, v in six.iteritems(properties):
         params[k] = v
 
-    retries = 5
-    while retries > 0:
-        retries = retries - 1
+    result = aws.query(params,
+                       return_root=True,
+                       location=get_location(vm_),
+                       provider=get_provider(),
+                       opts=__opts__,
+                       sigver='4')
 
-        result = aws.query(params,
-                           return_root=True,
-                           location=get_location(vm_),
-                           provider=get_provider(),
-                           opts=__opts__,
-                           sigver='4')
-
-        if isinstance(result, dict) and result.get('error'):
-            time.sleep(1)
-            continue
-
-        return result
-
-    raise SaltCloudException(
-        'Could not change interface <{0}> attributes '
-        '<\'{1}\'> after 5 retries'.format(
-            eni_id, properties
+    if isinstance(result, dict) and result.get('error'):
+        raise SaltCloudException(
+            'Could not change interface <{0}> attributes <\'{1}\'>'.format(
+                eni_id, properties
+            )
         )
-    )
+    else:
+        return result
 
 
 def _associate_eip_with_interface(eni_id, eip_id, private_ip=None, vm_=None):
@@ -1563,43 +1586,34 @@ def _associate_eip_with_interface(eni_id, eip_id, private_ip=None, vm_=None):
     be NATted to - useful if you have multiple IP addresses assigned to an
     interface.
     '''
-    retries = 5
-    while retries > 0:
-        params = {'Action': 'AssociateAddress',
-                  'NetworkInterfaceId': eni_id,
-                  'AllocationId': eip_id}
+    params = {'Action': 'AssociateAddress',
+              'NetworkInterfaceId': eni_id,
+              'AllocationId': eip_id}
 
-        if private_ip:
-            params['PrivateIpAddress'] = private_ip
+    if private_ip:
+        params['PrivateIpAddress'] = private_ip
 
-        retries = retries - 1
-        result = aws.query(params,
-                           return_root=True,
-                           location=get_location(vm_),
-                           provider=get_provider(),
-                           opts=__opts__,
-                           sigver='4')
+    result = aws.query(params,
+                       return_root=True,
+                       location=get_location(vm_),
+                       provider=get_provider(),
+                       opts=__opts__,
+                       sigver='4')
 
-        if isinstance(result, dict) and result.get('error'):
-            time.sleep(1)
-            continue
-
-        if not result[2].get('associationId'):
-            break
-
-        log.debug(
-            'Associated ElasticIP address %s with interface %s',
-            eip_id, eni_id
+    if not result[2].get('associationId'):
+        raise SaltCloudException(
+            'Could not associate elastic ip address '
+            '<{0}> with network interface <{1}>'.format(
+                eip_id, eni_id
+            )
         )
 
-        return result[2].get('associationId')
-
-    raise SaltCloudException(
-        'Could not associate elastic ip address '
-        '<{0}> with network interface <{1}>'.format(
-            eip_id, eni_id
-        )
+    log.debug(
+        'Associated ElasticIP address %s with interface %s',
+        eip_id, eni_id
     )
+
+    return result[2].get('associationId')
 
 
 def _update_enis(interfaces, instance, vm_=None):
@@ -1768,7 +1782,7 @@ def request_instance(vm_=None, call=None):
         # Normal instances should have no prefix.
         spot_prefix = ''
 
-    image_id = vm_['image']
+    image_id = get_imageid(vm_)
     params[spot_prefix + 'ImageId'] = image_id
 
     userdata = None
@@ -1977,7 +1991,8 @@ def request_instance(vm_=None, call=None):
             params[termination_key] = six.text_type(set_del_root_vol_on_destroy).lower()
 
             # Use default volume type if not specified
-            if ex_blockdevicemappings and dev_index < len(ex_blockdevicemappings) and 'Ebs.VolumeType' not in ex_blockdevicemappings[dev_index]:
+            if ex_blockdevicemappings and dev_index < len(ex_blockdevicemappings) and \
+                   'Ebs.VolumeType' not in ex_blockdevicemappings[dev_index]:
                 type_key = '{0}BlockDeviceMapping.{1}.Ebs.VolumeType'.format(spot_prefix, dev_index)
                 params[type_key] = rd_type
 
@@ -2147,8 +2162,8 @@ def query_instance(vm_=None, call=None):
 
     provider = get_provider(vm_)
 
-    attempts = 5
-    while attempts > 0:
+    attempts = 0
+    while attempts < aws.AWS_MAX_RETRIES:
         data, requesturl = aws.query(params,                # pylint: disable=unbalanced-tuple-unpacking
                                      location=location,
                                      provider=provider,
@@ -2162,22 +2177,17 @@ def query_instance(vm_=None, call=None):
                 'There was an error in the query. %s attempts '
                 'remaining: %s', attempts, data['error']
             )
-            attempts -= 1
-            # Just a little delay between attempts...
-            time.sleep(1)
-            continue
-
-        if isinstance(data, list) and not data:
+        elif isinstance(data, list) and not data:
             log.warning(
                 'Query returned an empty list. %s attempts '
                 'remaining.', attempts
             )
-            attempts -= 1
-            # Just a little delay between attempts...
-            time.sleep(1)
-            continue
+        else:
+            break
 
-        break
+        aws.sleep_exponential_backoff(attempts)
+        attempts += 1
+        continue
     else:
         raise SaltCloudSystemExit(
             'An error occurred while creating VM: {0}'.format(data['error'])
@@ -2185,7 +2195,6 @@ def query_instance(vm_=None, call=None):
 
     def __query_ip_address(params, url):  # pylint: disable=W0613
         data = aws.query(params,
-                         #requesturl=url,
                          location=location,
                          provider=provider,
                          opts=__opts__,
@@ -2342,7 +2351,7 @@ def wait_for_instance(
                     vm_['win_password'] = win_passwd
                     break
 
-        # SMB used whether winexe or winrm
+        # SMB used whether psexec or winrm
         if not salt.utils.cloud.wait_for_port(ip_address,
                                               port=445,
                                               timeout=ssh_connect_timeout):
@@ -2350,10 +2359,10 @@ def wait_for_instance(
                 'Failed to connect to remote windows host'
             )
 
-        # If not using winrm keep same winexe behavior
+        # If not using winrm keep same psexec behavior
         if not use_winrm:
 
-            log.debug('Trying to authenticate via SMB using winexe')
+            log.debug('Trying to authenticate via SMB using psexec')
 
             if not salt.utils.cloud.validate_windows_cred(ip_address,
                                                           username,
@@ -2998,9 +3007,9 @@ def set_tags(name=None,
         params['Tag.{0}.Key'.format(idx)] = tag_k
         params['Tag.{0}.Value'.format(idx)] = tag_v
 
-    attempts = 5
-    while attempts >= 0:
-        result = aws.query(params,
+    attempts = 0
+    while attempts < aws.AWS_MAX_RETRIES:
+        aws.query(params,
                            setname='tagSet',
                            location=location,
                            provider=get_provider(),
@@ -3034,9 +3043,8 @@ def set_tags(name=None,
 
         if failed_to_set_tags:
             log.warning('Failed to set tags. Remaining attempts %s', attempts)
-            attempts -= 1
-            # Just a little delay between attempts...
-            time.sleep(1)
+            attempts += 1
+            aws.sleep_exponential_backoff(attempts)
             continue
 
         return settags
@@ -3375,8 +3383,8 @@ def _get_node(name=None, instance_id=None, location=None):
 
     provider = get_provider()
 
-    attempts = 10
-    while attempts >= 0:
+    attempts = 0
+    while attempts < aws.AWS_MAX_RETRIES:
         try:
             instances = aws.query(params,
                                   location=location,
@@ -3386,13 +3394,12 @@ def _get_node(name=None, instance_id=None, location=None):
             instance_info = _extract_instance_info(instances).values()
             return next(iter(instance_info))
         except IndexError:
-            attempts -= 1
+            attempts += 1
             log.debug(
                 'Failed to get the data for node \'%s\'. Remaining '
                 'attempts: %s', instance_id or name, attempts
             )
-            # Just a little delay between attempts...
-            time.sleep(0.5)
+            aws.sleep_exponential_backoff(attempts)
     return {}
 
 
@@ -3669,6 +3676,25 @@ def enable_term_protect(name, call=None):
     return _toggle_term_protect(name, 'true')
 
 
+def disable_term_protect(name, call=None):
+    '''
+    Disable termination protection on a node
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -a disable_term_protect mymachine
+    '''
+    if call != 'action':
+        raise SaltCloudSystemExit(
+            'The enable_term_protect action must be called with '
+            '-a or --action.'
+        )
+
+    return _toggle_term_protect(name, 'false')
+
+
 def disable_detailed_monitoring(name, call=None):
     '''
     Enable/disable detailed monitoring on a node
@@ -3897,7 +3923,8 @@ def register_image(kwargs=None, call=None):
 
     .. code-block:: bash
 
-        salt-cloud -f register_image my-ec2-config ami_name=my_ami description="my description" root_device_name=/dev/xvda snapshot_id=snap-xxxxxxxx
+        salt-cloud -f register_image my-ec2-config ami_name=my_ami description="my description"
+                root_device_name=/dev/xvda snapshot_id=snap-xxxxxxxx
     '''
 
     if call != 'function':
@@ -4723,7 +4750,7 @@ def get_password_data(
     for item in data:
         ret[next(six.iterkeys(item))] = next(six.itervalues(item))
 
-    if not HAS_PYCRYPTO:
+    if not HAS_M2 and not HAS_PYCRYPTO:
         return ret
 
     if 'key' not in kwargs:
@@ -4736,11 +4763,16 @@ def get_password_data(
         if pwdata is not None:
             rsa_key = kwargs['key']
             pwdata = base64.b64decode(pwdata)
-            dsize = Crypto.Hash.SHA.digest_size
-            sentinel = Crypto.Random.new().read(15 + dsize)
-            key_obj = Crypto.PublicKey.RSA.importKey(rsa_key)
-            key_obj = PKCS1_v1_5.new(key_obj)
-            ret['password'] = key_obj.decrypt(pwdata, sentinel)
+            if HAS_M2:
+                key = RSA.load_key_string(rsa_key)
+                password = key.private_decrypt(pwdata, RSA.pkcs1_padding)
+            else:
+                dsize = Crypto.Hash.SHA.digest_size
+                sentinel = Crypto.Random.new().read(15 + dsize)
+                key_obj = Crypto.PublicKey.RSA.importKey(rsa_key)
+                key_obj = PKCS1_v1_5.new(key_obj)
+                password = key_obj.decrypt(pwdata, sentinel)
+            ret['password'] = password
 
     return ret
 
